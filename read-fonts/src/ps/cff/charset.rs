@@ -100,6 +100,17 @@ impl<'a> Charset<'a> {
         }
     }
 
+    /// Returns the glyph identifier for the given standard encoding code.
+    ///
+    /// The `seac` operator, and the `endchar` operator standing in for it,
+    /// name their base and accent glyphs by standard encoding code rather
+    /// than by string identifier or glyph identifier.
+    pub fn standard_code_glyph_id(&self, code: i32) -> Option<GlyphId> {
+        let code: u8 = code.try_into().ok()?;
+        let sid = *crate::ps::encoding::STANDARD_ENCODING.get(code as usize)?;
+        self.glyph_id(Sid::new(sid as u16))
+    }
+
     /// Returns an iterator over all of the glyph and string identifier
     /// mappings.
     pub fn iter(&self) -> Iter<'a> {

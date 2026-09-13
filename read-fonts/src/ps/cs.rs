@@ -6,7 +6,6 @@ use crate::{
         cff::{blend::BlendState, charset::Charset, index::Index, stack::Stack},
         error::Error,
         num,
-        string::Sid,
         transform::{FontMatrix, Transform},
     },
     tables::cff::Cff,
@@ -82,13 +81,12 @@ impl<'a> CharstringContext for (&'a [u8], &'a Index<'a>, &'a Index<'a>, &'a Inde
             .charset(0)
             .or_else(|| Charset::new(FontData::default(), 0, self.1.count()))
             .ok_or(Error::MissingCharset)?;
-        let seac_to_gid = |code: i32| {
-            let code: u8 = code.try_into().ok()?;
-            let sid = *super::encoding::STANDARD_ENCODING.get(code as usize)?;
-            charset.glyph_id(Sid::new(sid as u16))
-        };
-        let accent_gid = seac_to_gid(accent_code).ok_or(Error::InvalidSeacCode(accent_code))?;
-        let base_gid = seac_to_gid(base_code).ok_or(Error::InvalidSeacCode(base_code))?;
+        let accent_gid = charset
+            .standard_code_glyph_id(accent_code)
+            .ok_or(Error::InvalidSeacCode(accent_code))?;
+        let base_gid = charset
+            .standard_code_glyph_id(base_code)
+            .ok_or(Error::InvalidSeacCode(base_code))?;
         let accent_charstring = self
             .1
             .get(accent_gid.to_u32() as usize)

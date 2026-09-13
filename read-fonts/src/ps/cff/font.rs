@@ -7,7 +7,7 @@ use crate::{
             blend::BlendState, charset::Charset, dict, encoding::Encoding as RawEncoding,
             fd_select::FdSelect, index::Index,
         },
-        cs::{self, CommandSink, NopFilterSink, TransformSink},
+        cs::{self, CommandSink, NopFilterSink, NullSink, TransformSink},
         encoding::PredefinedEncoding,
         error::Error,
         hinting::HintingParams,
@@ -17,7 +17,7 @@ use crate::{
     tables::{cff, cff2, variations::ItemVariationStore},
     FontData, FontRead,
 };
-use core::ops::Range;
+use core::{cell::Cell, ops::Range};
 use types::{BoundingBox, F2Dot14, Fixed, GlyphId};
 
 /// A CFF or CFF2 font.
@@ -432,6 +432,56 @@ impl<'a> CffFontRef<'a> {
         }
     }
 
+    /// Returns the base and accent glyphs a `seac` glyph is drawn from, if it
+    /// is one.
+    ///
+    /// A standard encoded accented character composes two other glyphs of the
+    /// same font, named by standard encoding code, either through the `seac`
+    /// operator or through an `endchar` carrying its arguments. Anything that
+    /// keeps a subset of the glyphs has to keep those two along with it.
+    ///
+    /// The charstring is evaluated to find them, because the codes can be
+    /// pushed by a subroutine rather than written in the charstring itself.
+    pub fn seac_components(
+        &self,
+        subfont: &Subfont,
+        gid: GlyphId,
+    ) -> Result<Option<[GlyphId; 2]>, Error> {
+        let charset = self.charset().ok_or(Error::MissingCharset)?;
+        let charstrings = self.top_dict.charstrings.clone();
+        let subrs = if subfont.subrs_offset != 0 {
+            let data = self
+                .data
+                .get(subfont.subrs_offset as usize..)
+                .ok_or(Error::Malformed)?;
+            Index::new(data, self.is_cff2)?
+        } else {
+            Index::Empty
+        };
+        let charstring_data = charstrings
+            .get(gid.to_u32() as usize)
+            .ok_or(Error::Malformed)?;
+        if !may_end_in_seac(charstring_data) {
+            return Ok(None);
+        }
+        let recorder = SeacRecorder {
+            inner: (self.data, &charstrings, &self.global_subrs, &subrs),
+            codes: Cell::new(None),
+        };
+        let mut sink = NullSink;
+        cs::evaluate(&recorder, None, charstring_data, &mut sink)?;
+        let Some([base_code, accent_code]) = recorder.codes.get() else {
+            return Ok(None);
+        };
+        let base = charset
+            .standard_code_glyph_id(base_code)
+            .ok_or(Error::InvalidSeacCode(base_code))?;
+        let accent = charset
+            .standard_code_glyph_id(accent_code)
+            .ok_or(Error::InvalidSeacCode(accent_code))?;
+        Ok(Some([base, accent]))
+    }
+
     /// Returns the advance width of the glyph with an optional size in
     /// ppem, without drawing it.
     ///
@@ -600,6 +650,74 @@ enum CffFontKind<'a> {
         /// Index containing font dicts.
         fd_array: Index<'a>,
     },
+}
+
+/// Returns `false` where a charstring cannot be a `seac` after all.
+///
+/// A seac is an `endchar` with its arguments in front of it, so a charstring
+/// that does not end in one is not a seac and needs no evaluating. Type 2
+/// numbers do not synchronize when read backwards, so every operand encoding
+/// that could end at the `endchar` has to be allowed through.
+///
+/// See <https://github.com/harfbuzz/harfbuzz/blob/main/src/hb-ot-cff1-table.cc>.
+fn may_end_in_seac(charstring: &[u8]) -> bool {
+    /// One byte integer operands.
+    const ONE_BYTE_INT: core::ops::RangeInclusive<u8> = 32..=246;
+    /// Two byte integer operands, positive and negative.
+    const TWO_BYTE_INT: core::ops::RangeInclusive<u8> = 247..=254;
+    const SHORT_INT: u8 = 28;
+    const FIXED: u8 = 255;
+    const CALLSUBR: u8 = 10;
+    const CALLGSUBR: u8 = 29;
+    const ENDCHAR: u8 = 14;
+
+    let Some((&ENDCHAR, head)) = charstring.split_last() else {
+        return false;
+    };
+    let Some((&last, _)) = head.split_last() else {
+        return false;
+    };
+    if ONE_BYTE_INT.contains(&last)
+        || head.len() >= 2 && TWO_BYTE_INT.contains(&head[head.len() - 2])
+        || head.len() >= 3 && head[head.len() - 3] == SHORT_INT
+        || head.len() >= 5 && head[head.len() - 5] == FIXED
+    {
+        return true;
+    }
+    // A subroutine can leave the seac operands on the shared stack.
+    last == CALLSUBR || last == CALLGSUBR
+}
+
+/// A charstring context that notes the codes a `seac` asks for.
+///
+/// The evaluator resolves those codes through the context, so wrapping one is
+/// enough to see them without the interpreter knowing anything about it.
+struct SeacRecorder<T> {
+    inner: T,
+    codes: Cell<Option<[i32; 2]>>,
+}
+
+impl<T: cs::CharstringContext> cs::CharstringContext for SeacRecorder<T> {
+    fn kind(&self) -> cs::CharstringKind {
+        self.inner.kind()
+    }
+
+    fn seac_components(&self, base_code: i32, accent_code: i32) -> Result<[&[u8]; 2], Error> {
+        self.codes.set(Some([base_code, accent_code]));
+        self.inner.seac_components(base_code, accent_code)
+    }
+
+    fn global_subr(&self, index: i32) -> Result<&[u8], Error> {
+        self.inner.global_subr(index)
+    }
+
+    fn subr(&self, index: i32) -> Result<&[u8], Error> {
+        self.inner.subr(index)
+    }
+
+    fn weight_vector(&self) -> &[Fixed] {
+        self.inner.weight_vector()
+    }
 }
 
 /// Metadata for a CFF subfont.
@@ -1001,6 +1119,55 @@ mod tests {
     };
     use cs::test_helpers::*;
     use font_test_data::bebuffer::BeBuffer;
+
+    /// A seac glyph names the two glyphs it composes; everything else names
+    /// none.
+    ///
+    /// In this font gid 3 is Scaron, drawn from S and caron through an
+    /// endchar carrying seac arguments.
+    #[test]
+    fn seac_components() {
+        let font = FontRef::new(font_test_data::CHARSTRING_PATH_OPS).unwrap();
+        let cff =
+            CffFontRef::new_cff(font.cff().unwrap().offset_data().as_bytes(), 0, None).unwrap();
+        let subfont = cff.subfont(0, &[]).unwrap();
+        let components = |gid: u32| {
+            cff.seac_components(&subfont, GlyphId::new(gid))
+                .unwrap()
+                .map(|gids| gids.map(|gid| gid.to_u32()))
+        };
+        assert_eq!(components(3), Some([2, 4]));
+        for gid in [0, 1, 2, 4] {
+            assert_eq!(components(gid), None, "gid {gid} is not a seac glyph");
+        }
+    }
+
+    /// The cheap check in front of the evaluator never rejects a seac.
+    ///
+    /// A false negative there silently drops a glyph from a subset, so every
+    /// operand encoding that can carry the accent code has to survive it.
+    #[test]
+    fn may_end_in_seac_keeps_every_operand_encoding() {
+        // an accent code in each of the four operand encodings, then endchar
+        // (a one byte operand only reaches 107, so that one carries code 100)
+        assert!(may_end_in_seac(&[100 + 139, 14]));
+        assert!(may_end_in_seac(&[247, 99, 14]));
+        assert!(may_end_in_seac(&[28, 0, 207, 14]));
+        assert!(may_end_in_seac(&[255, 0, 207, 0, 0, 14]));
+        // or left on the stack by a subroutine
+        assert!(may_end_in_seac(&[139, 10, 14]));
+        assert!(may_end_in_seac(&[139, 29, 14]));
+
+        // a charstring that ends in anything else is not a seac
+        assert!(!may_end_in_seac(&[]));
+        assert!(!may_end_in_seac(&[14]));
+        assert!(
+            !may_end_in_seac(&[139, 1, 21, 14]),
+            "hstem, rmoveto, endchar"
+        );
+        // and neither is one that does not end in endchar at all
+        assert!(!may_end_in_seac(&[139, 139, 21]));
+    }
 
     #[test]
     fn read_cff_static() {
