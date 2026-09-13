@@ -154,6 +154,141 @@ impl Operator {
             _ => return None,
         })
     }
+
+    /// Returns the opcode that encodes this operator.
+    ///
+    /// The second byte is present for extended operators, which are written
+    /// as the escape opcode 12 followed by that byte.
+    pub fn opcode(self) -> (u8, Option<u8>) {
+        use Operator::*;
+        const ESCAPE: u8 = 12;
+        match self {
+            // Top DICT operators
+            Version => (0, None),
+            Notice => (1, None),
+            FullName => (2, None),
+            FamilyName => (3, None),
+            Weight => (4, None),
+            FontBbox => (5, None),
+            UniqueId => (13, None),
+            Xuid => (14, None),
+            Charset => (15, None),
+            Encoding => (16, None),
+            CharstringsOffset => (17, None),
+            PrivateDictRange => (18, None),
+            VariationStoreOffset => (24, None),
+            // Private DICT operators
+            BlueValues => (6, None),
+            OtherBlues => (7, None),
+            FamilyBlues => (8, None),
+            FamilyOtherBlues => (9, None),
+            StdHw => (10, None),
+            StdVw => (11, None),
+            SubrsOffset => (19, None),
+            DefaultWidthX => (20, None),
+            NominalWidthX => (21, None),
+            VariationStoreIndex => (22, None),
+            Blend => (23, None),
+            // Extended Top DICT operators
+            Copyright => (ESCAPE, Some(0)),
+            IsFixedPitch => (ESCAPE, Some(1)),
+            ItalicAngle => (ESCAPE, Some(2)),
+            UnderlinePosition => (ESCAPE, Some(3)),
+            UnderlineThickness => (ESCAPE, Some(4)),
+            PaintType => (ESCAPE, Some(5)),
+            CharstringType => (ESCAPE, Some(6)),
+            FontMatrix => (ESCAPE, Some(7)),
+            StrokeWidth => (ESCAPE, Some(8)),
+            SyntheticBase => (ESCAPE, Some(20)),
+            PostScript => (ESCAPE, Some(21)),
+            BaseFontName => (ESCAPE, Some(22)),
+            BaseFontBlend => (ESCAPE, Some(23)),
+            Ros => (ESCAPE, Some(30)),
+            CidFontVersion => (ESCAPE, Some(31)),
+            CidFontRevision => (ESCAPE, Some(32)),
+            CidFontType => (ESCAPE, Some(33)),
+            CidCount => (ESCAPE, Some(34)),
+            UidBase => (ESCAPE, Some(35)),
+            FdArrayOffset => (ESCAPE, Some(36)),
+            FdSelectOffset => (ESCAPE, Some(37)),
+            FontName => (ESCAPE, Some(38)),
+            // Extended Private DICT operators
+            BlueScale => (ESCAPE, Some(9)),
+            BlueShift => (ESCAPE, Some(10)),
+            BlueFuzz => (ESCAPE, Some(11)),
+            StemSnapH => (ESCAPE, Some(12)),
+            StemSnapV => (ESCAPE, Some(13)),
+            ForceBold => (ESCAPE, Some(14)),
+            LanguageGroup => (ESCAPE, Some(17)),
+            ExpansionFactor => (ESCAPE, Some(18)),
+            InitialRandomSeed => (ESCAPE, Some(19)),
+        }
+    }
+
+    /// All operators that can appear in a DICT.
+    ///
+    /// Used to check that [`Operator::opcode`] and the parsing tables agree.
+    #[cfg(test)]
+    const ALL: &'static [Self] = {
+        use Operator::*;
+        &[
+            Version,
+            Notice,
+            FullName,
+            FamilyName,
+            Weight,
+            FontBbox,
+            CharstringsOffset,
+            PrivateDictRange,
+            VariationStoreOffset,
+            Copyright,
+            IsFixedPitch,
+            ItalicAngle,
+            UnderlinePosition,
+            UnderlineThickness,
+            PaintType,
+            CharstringType,
+            FontMatrix,
+            StrokeWidth,
+            FdArrayOffset,
+            FdSelectOffset,
+            BlueValues,
+            OtherBlues,
+            FamilyBlues,
+            FamilyOtherBlues,
+            SubrsOffset,
+            VariationStoreIndex,
+            BlueScale,
+            BlueShift,
+            BlueFuzz,
+            LanguageGroup,
+            ExpansionFactor,
+            Encoding,
+            Charset,
+            UniqueId,
+            Xuid,
+            SyntheticBase,
+            PostScript,
+            BaseFontName,
+            BaseFontBlend,
+            Ros,
+            CidFontVersion,
+            CidFontRevision,
+            CidFontType,
+            CidCount,
+            UidBase,
+            FontName,
+            StdHw,
+            StdVw,
+            DefaultWidthX,
+            NominalWidthX,
+            Blend,
+            StemSnapH,
+            StemSnapV,
+            ForceBold,
+            InitialRandomSeed,
+        ]
+    };
 }
 
 /// Either a PostScript DICT operator or a (numeric) operand.
@@ -532,6 +667,22 @@ mod tests {
         TableProvider,
     };
     use font_test_data::bebuffer::BeBuffer;
+
+    /// Every operator round trips through the opcode it is written as.
+    ///
+    /// Writers encode operators with [`Operator::opcode`], so that table and
+    /// the parsing tables have to stay in agreement.
+    #[test]
+    fn operator_opcode_round_trip() {
+        for &operator in Operator::ALL {
+            let parsed = match operator.opcode() {
+                (opcode, None) => Operator::from_opcode(opcode),
+                (12, Some(opcode)) => Operator::from_extended_opcode(opcode),
+                (escape, Some(_)) => panic!("{operator:?} has a bogus escape opcode {escape}"),
+            };
+            assert_eq!(parsed, Some(operator));
+        }
+    }
 
     /// An unknown operator is a token, not the end of the iteration.
     ///
