@@ -56,6 +56,7 @@ use thiserror::Error;
 use write_fonts::{
     read::{
         collections::{int_set::Domain, IntSet},
+        ps::cff::CffFontRef,
         tables::{
             avar::Avar,
             base::Base,
@@ -591,6 +592,8 @@ impl Plan {
             self.glyphset = self.glyphset_colred.clone();
         }
 
+        self.cff_seac_closure(font);
+
         self.nameid_closure(font);
         self.collect_layout_var_indices(font);
     }
@@ -652,6 +655,43 @@ impl Plan {
                 self.glyph_map_gsub[g.to_u32() as usize] = *new_gid;
             }
         }
+    }
+
+    /// Add the base and accent glyphs that retained `seac` glyphs draw.
+    ///
+    /// A standard encoded accented character is composed of two other glyphs
+    /// of the same font, so dropping either would leave it drawing nothing.
+    ///
+    /// reference: <https://github.com/harfbuzz/harfbuzz/blob/a070f9ebbe88dc71b248af9731dd49ec93f4e6e6/src/hb-subset-plan.cc#L503>
+    fn cff_seac_closure(&mut self, font: &FontRef) {
+        let Ok(cff) = font.cff() else {
+            return;
+        };
+        let Ok(cff) = CffFontRef::new_cff(cff.offset_data().as_bytes(), 0, None) else {
+            return;
+        };
+        // seac names its components by standard encoding code, which reaches
+        // a glyph through the charset's string ids. A CID font's charset maps
+        // to CIDs instead, so nothing there can be a seac.
+        if cff.is_cid() {
+            return;
+        }
+        let Ok(subfont) = cff.subfont(0, &[]) else {
+            return;
+        };
+
+        let mut components = IntSet::empty();
+        for gid in self.glyphset_colred.iter() {
+            // A charstring we cannot read is one we cannot find a seac in.
+            if let Ok(Some(gids)) = cff.seac_components(&subfont, gid) {
+                components.extend(gids);
+            }
+        }
+        if components.is_empty() {
+            return;
+        }
+        self.glyphset.union(&components);
+        remove_invalid_gids(&mut self.glyphset, self.font_num_glyphs);
     }
 
     fn colr_closure(&mut self, font: &FontRef) {
@@ -1518,6 +1558,28 @@ mod test {
         assert_eq!(plan.unicode_to_new_gid_list.len(), 2);
         assert_eq!(plan.unicode_to_new_gid_list[0], (0x2c_u32, GlyphId::new(2)));
         assert_eq!(plan.unicode_to_new_gid_list[1], (0x31_u32, GlyphId::new(4)));
+    }
+
+    /// A retained seac glyph keeps the base and accent it draws.
+    ///
+    /// In this font gid 3 is Scaron, composed of S at gid 2 and caron at
+    /// gid 4, neither of which anything else in the subset asks for.
+    #[test]
+    fn cff_seac_closure_keeps_components() {
+        let mut plan = Plan::default();
+        let font = FontRef::new(font_test_data::CHARSTRING_PATH_OPS).unwrap();
+        plan.font_num_glyphs = get_font_num_glyphs(&font);
+        plan.glyphset_gsub.insert(GlyphId::new(3));
+
+        plan.populate_gids_to_retain(&font);
+
+        assert!(plan.glyphset.contains(GlyphId::new(3)), "Scaron");
+        assert!(plan.glyphset.contains(GlyphId::new(2)), "S");
+        assert!(plan.glyphset.contains(GlyphId::new(4)), "caron");
+        assert!(
+            !plan.glyphset.contains(GlyphId::new(1)),
+            "i is not asked for"
+        );
     }
 
     #[test]
